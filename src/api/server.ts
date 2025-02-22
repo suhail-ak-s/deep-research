@@ -2,6 +2,7 @@ import express from 'express';
 import { deepResearch, writeFinalReport, AgentTools, AgentApiConfig, ResearchProgress } from '../deep-research';
 import dotenv from 'dotenv';
 import cors from 'cors';
+import { v4 as uuidv4 } from 'uuid';
 
 // Load environment variables
 dotenv.config({path: '.env.local'});
@@ -14,14 +15,91 @@ console.log('Starting server on port', port);
 app.use(express.json());
 app.use(cors());
 
-// Add request logging middleware
+// Add request logging middleware with request ID
 app.use((req, res, next) => {
+  const requestId = uuidv4();
+  res.locals.requestId = requestId;
+  
+  console.log({
+    timestamp: new Date().toISOString(),
+    requestId,
+    method: req.method,
+    path: req.path,
+    query: req.query,
+    headers: {
+      'user-agent': req.headers['user-agent'],
+      'accept': req.headers.accept,
+      'content-type': req.headers['content-type']
+    }
+  });
+
+  res.on('finish', () => {
+    console.log({
+      timestamp: new Date().toISOString(),
+      requestId,
+      method: req.method,
+      path: req.path,
+      statusCode: res.statusCode,
+      responseTime: Date.now() - req.socket.bytesRead
+    });
+  });
+
   next();
 });
 
-// Helper function to send SSE messages
+// Error handling middleware
+app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const requestId = res.locals.requestId;
+  console.error({
+    timestamp: new Date().toISOString(),
+    requestId,
+    error: {
+      name: err.name,
+      message: err.message,
+      stack: err.stack
+    }
+  });
+
+  const errorResponse = {
+    message: `# ❌ Server Error
+
+Request ID: ${requestId}
+Error: ${err.message}
+
+---
+*Please contact support with this Request ID if the issue persists.*`
+  };
+
+  if (req.headers.accept?.includes('text/event-stream')) {
+    sendSSEMessage(res, 'error', errorResponse);
+    res.end();
+  } else {
+    res.status(500).json(errorResponse);
+  }
+});
+
+// Helper function to send SSE messages with logging
 function sendSSEMessage(res: express.Response, event: string, data: any) {
-  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  try {
+    const message = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    res.write(message);
+    
+    // Log SSE message sent
+    console.log({
+      timestamp: new Date().toISOString(),
+      requestId: res.locals.requestId,
+      event: 'sse_message_sent',
+      messageType: event,
+      messageLength: message.length
+    });
+  } catch (error) {
+    console.error({
+      timestamp: new Date().toISOString(),
+      requestId: res.locals.requestId,
+      event: 'sse_message_error',
+      error: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
 }
 
 // Health check endpoint
@@ -31,6 +109,22 @@ app.get('/health', (req, res) => {
 
 // Deep Research endpoint with SSE support
 app.post('/api/research', async (req, res) => {
+  const requestId = res.locals.requestId;
+  
+  // Log research request
+  console.log({
+    timestamp: new Date().toISOString(),
+    requestId,
+    event: 'research_request_received',
+    query: req.body.query,
+    parameters: {
+      breadth: req.body.breadth,
+      depth: req.body.depth,
+      hasCustomTools: !!req.body.agentTools,
+      hasApiConfig: !!req.body.agentApiConfig
+    }
+  });
+
   // Check if client accepts SSE
   const wantsSSE = req.headers.accept?.includes('text/event-stream');
   
@@ -43,6 +137,7 @@ app.post('/api/research', async (req, res) => {
     // Send initial connection message
     sendSSEMessage(res, 'message', { 
       message: `# 🔍 Deep Research Session Started
+Request ID: ${requestId}
 
 *Initializing your research journey...*`
     });
@@ -57,66 +152,91 @@ app.post('/api/research', async (req, res) => {
       agentApiConfig 
     } = req.body;
 
+    // Validate required parameters
     if (!query) {
-      if (wantsSSE) {
-        sendSSEMessage(res, 'message', {
-          message: `# ❌ Error
-          
-Query is required to start research.`
-        });
-        return res.end();
-      }
-      return res.status(400).json({ message: 'Error: Query is required to start research.' });
-    }
-
-    // Send research configuration message
-    if (wantsSSE) {
-      sendSSEMessage(res, 'message', {
-        message: `# 📋 Research Configuration
-
-### Main Query
-${query}
-
-### Research Parameters
-- **Depth:** ${depth} levels of investigation
-- **Breadth:** ${breadth} parallel research paths
-- **Mode:** ${agentTools ? 'Using Custom Research Tools' : 'Using Standard Research Tools'}
-
----
-*Initiating comprehensive research process...*`
+      const error = new Error('Query is required to start research.');
+      console.error({
+        timestamp: new Date().toISOString(),
+        requestId,
+        event: 'validation_error',
+        error: error.message
       });
-    }
 
-    // Validate agentTools if provided
-    if (agentTools && (!agentTools.queryGenerator || !agentTools.searcher || !agentTools.resultProcessor)) {
       if (wantsSSE) {
-        sendSSEMessage(res, 'message', {
-          message: `# ❌ Configuration Error
+        sendSSEMessage(res, 'error', {
+          message: `# ❌ Validation Error
+Request ID: ${requestId}
 
-Custom tools configuration is incomplete. Required components:
-- Query Generator
-- Searcher
-- Result Processor`
+${error.message}`
         });
         return res.end();
       }
-      return res.status(400).json({ message: 'If agentTools is provided, it must include queryGenerator, searcher, and resultProcessor' });
+      return res.status(400).json({ requestId, error: error.message });
     }
 
-    // Validate agentApiConfig if provided
-    if (agentApiConfig && (!agentApiConfig.queryGeneratorEndpoint || !agentApiConfig.searchEndpoint || !agentApiConfig.resultProcessorEndpoint)) {
-      if (wantsSSE) {
-        sendSSEMessage(res, 'message', {
-          message: `# ❌ API Configuration Error
+    // Validate research parameters
+    if (breadth < 1 || breadth > 10) {
+      const error = new Error('Breadth must be between 1 and 10');
+      console.error({
+        timestamp: new Date().toISOString(),
+        requestId,
+        event: 'validation_error',
+        error: error.message,
+        value: breadth
+      });
+      throw error;
+    }
 
-API configuration is incomplete. Required endpoints:
-- Query Generator Endpoint
-- Search Endpoint
-- Result Processor Endpoint`
+    if (depth < 1 || depth > 5) {
+      const error = new Error('Depth must be between 1 and 5');
+      console.error({
+        timestamp: new Date().toISOString(),
+        requestId,
+        event: 'validation_error',
+        error: error.message,
+        value: depth
+      });
+      throw error;
+    }
+
+    // Validate agent tools
+    if (agentTools) {
+      const missingTools = [];
+      if (!agentTools.queryGenerator) missingTools.push('Query Generator');
+      if (!agentTools.searcher) missingTools.push('Searcher');
+      if (!agentTools.resultProcessor) missingTools.push('Result Processor');
+
+      if (missingTools.length > 0) {
+        const error = new Error(`Missing required tools: ${missingTools.join(', ')}`);
+        console.error({
+          timestamp: new Date().toISOString(),
+          requestId,
+          event: 'validation_error',
+          error: error.message,
+          missingTools
         });
-        return res.end();
+        throw error;
       }
-      return res.status(400).json({ message: 'If agentApiConfig is provided, it must include queryGeneratorEndpoint, searchEndpoint, and resultProcessorEndpoint' });
+    }
+
+    // Validate API config
+    if (agentApiConfig) {
+      const missingEndpoints = [];
+      if (!agentApiConfig.queryGeneratorEndpoint) missingEndpoints.push('Query Generator Endpoint');
+      if (!agentApiConfig.searchEndpoint) missingEndpoints.push('Search Endpoint');
+      if (!agentApiConfig.resultProcessorEndpoint) missingEndpoints.push('Result Processor Endpoint');
+
+      if (missingEndpoints.length > 0) {
+        const error = new Error(`Missing required API endpoints: ${missingEndpoints.join(', ')}`);
+        console.error({
+          timestamp: new Date().toISOString(),
+          requestId,
+          event: 'validation_error',
+          error: error.message,
+          missingEndpoints
+        });
+        throw error;
+      }
     }
 
     let lastProgress: ResearchProgress | null = null;
@@ -236,6 +356,16 @@ ${questionsMessage}
       const learningsMessage = result.learnings.map((learning, i) => `${i + 1}. ${learning}`).join('\n');
       const urlsMessage = result.visitedUrls.map((url, i) => `${i + 1}. [Source](${url})`).join('\n');
 
+      console.log({
+        timestamp: new Date().toISOString(),
+        requestId,
+        event: 'research_complete',
+        stats: {
+          totalLearnings: result.learnings.length,
+          totalSources: result.visitedUrls.length
+        }
+      });
+
       sendSSEMessage(res, 'message', {
         message: `# 📊 Final Research Results
 
@@ -248,6 +378,12 @@ ${urlsMessage}
 ---`
       });
 
+      console.log({
+        timestamp: new Date().toISOString(),
+        requestId,
+        event: 'report_generation_started'
+      });
+
       sendSSEMessage(res, 'message', { 
         message: `# 📝 Generating Final Report
 
@@ -257,10 +393,24 @@ ${urlsMessage}
       });
     }
 
+    console.log({
+      timestamp: new Date().toISOString(),
+      requestId,
+      event: 'generating_final_report',
+      prompt: query
+    });
+
     const report = await writeFinalReport({
       prompt: query,
       learnings: result.learnings,
       visitedUrls: result.visitedUrls,
+    });
+
+    console.log({
+      timestamp: new Date().toISOString(),
+      requestId,
+      event: 'report_generated',
+      reportLength: report.length
     });
 
     const finalResponse = {
@@ -274,31 +424,60 @@ ${report}
 
     if (wantsSSE) {
       sendSSEMessage(res, 'message', finalResponse);
+      console.log({
+        timestamp: new Date().toISOString(),
+        requestId,
+        event: 'sse_research_complete',
+        messageType: 'final_report'
+      });
       res.end();
     } else {
+      console.log({
+        timestamp: new Date().toISOString(),
+        requestId,
+        event: 'research_complete',
+        responseType: 'json'
+      });
       res.json(finalResponse);
     }
   } catch (error) {
-    console.error('Error during research:', error);
+    console.error({
+      timestamp: new Date().toISOString(),
+      requestId,
+      event: 'research_error',
+      error: error instanceof Error ? {
+        name: error.name,
+        message: error.message,
+        stack: error.stack
+      } : 'Unknown error',
+      query: req.body.query
+    });
+
     const errorResponse = {
       message: `# ❌ Research Error
+Request ID: ${requestId}
 
 ${error instanceof Error ? error.message : 'An unknown error occurred'}
 
 ---
-*Please try again or contact support if the issue persists.*`
+*Please contact support with this Request ID if the issue persists.*`
     };
 
     if (wantsSSE) {
-      sendSSEMessage(res, 'message', errorResponse);
+      sendSSEMessage(res, 'error', errorResponse);
       res.end();
     } else {
-      res.status(500).json(errorResponse);
+      res.status(500).json({ requestId, ...errorResponse });
     }
   }
 });
 
 // Start the server
 app.listen(port, () => {
-  console.log(`Deep Research API server running at http://localhost:${port}`);
-}); 
+  console.log({
+    timestamp: new Date().toISOString(),
+    event: 'server_start',
+    port,
+    url: `http://localhost:${port}`
+  });
+});
