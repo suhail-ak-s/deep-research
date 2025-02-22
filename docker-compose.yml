@@ -2,6 +2,8 @@ services:
   deep-research:
     container_name: deep-research
     build: .
+    ports:
+      - 4016:4016
     env_file:
       - .env.local
     volumes:
