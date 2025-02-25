@@ -11,6 +11,9 @@ const app = express();
 const port = process.env.PORT || 3000;
 console.log('Starting server on port', port);
 
+// Store active research sessions and their abort controllers
+const activeResearchSessions = new Map<string, AbortController>();
+
 // Middleware
 app.use(express.json());
 app.use(cors());
@@ -111,6 +114,20 @@ app.get('/health', (req, res) => {
 app.post('/api/research', async (req, res) => {
   const requestId = res.locals.requestId;
   
+  // Create abort controller for this session
+  const controller = new AbortController();
+  const signal = controller.signal;
+  activeResearchSessions.set(requestId, controller);
+  
+  // Debug point: Log research request details
+  console.debug({
+    event: 'debug_research_start',
+    requestId,
+    query: req.body.query,
+    headers: req.headers,
+    timestamp: new Date().toISOString()
+  });
+
   // Log research request
   console.log({
     timestamp: new Date().toISOString(),
@@ -125,6 +142,28 @@ app.post('/api/research', async (req, res) => {
     }
   });
 
+  // Clean up on client disconnect
+  res.on('close', () => {
+    // Debug point: Log disconnect details
+    console.debug({
+      event: 'debug_client_disconnect',
+      requestId,
+      wasAborted: signal.aborted,
+      timestamp: new Date().toISOString()
+    });
+
+    console.log({
+      timestamp: new Date().toISOString(),
+      requestId,
+      event: 'client_disconnected'
+    });
+    if (activeResearchSessions.has(requestId)) {
+      const controller = activeResearchSessions.get(requestId);
+      controller?.abort('Client disconnected');
+      activeResearchSessions.delete(requestId);
+    }
+  });
+
   // Check if client accepts SSE
   const wantsSSE = req.headers.accept?.includes('text/event-stream');
   
@@ -134,8 +173,16 @@ app.post('/api/research', async (req, res) => {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     
-    // Send initial connection message
-    sendSSEMessage(res, 'message', { 
+    // Debug point: Log SSE initialization
+    console.debug({
+      event: 'debug_sse_init',
+      requestId,
+      timestamp: new Date().toISOString()
+    });
+    
+    // Send initial connection message with requestId
+    sendSSEMessage(res, 'init', { 
+      requestId,
       message: `# 🔍 Deep Research Session Started
 Request ID: ${requestId}
 
@@ -246,6 +293,7 @@ ${error.message}`
       depth,
       agentTools,
       agentApiConfig,
+      signal, // Pass abort signal to deepResearch
       onProgress: (progress) => {
         if (wantsSSE && (!lastProgress || JSON.stringify(progress) !== JSON.stringify(lastProgress))) {
           // Send research depth info
@@ -441,6 +489,21 @@ ${report}
       res.json(finalResponse);
     }
   } catch (error) {
+    // Debug point: Log error details
+    console.debug({
+      event: 'debug_research_error',
+      requestId,
+      error: error instanceof Error ? {
+        name: error.name,
+        message: error.message,
+        stack: error.stack
+      } : 'Unknown error',
+      timestamp: new Date().toISOString()
+    });
+
+    // Remove the abort controller on error
+    activeResearchSessions.delete(requestId);
+
     console.error({
       timestamp: new Date().toISOString(),
       requestId,
@@ -469,6 +532,31 @@ ${error instanceof Error ? error.message : 'An unknown error occurred'}
     } else {
       res.status(500).json({ requestId, ...errorResponse });
     }
+  }
+});
+
+// Add disconnect endpoint
+app.post('/api/research/disconnect/:requestId', (req, res) => {
+  const { requestId } = req.params;
+  console.log({
+    timestamp: new Date().toISOString(),
+    event: 'disconnect_request',
+    requestId
+  });
+  
+  const controller = activeResearchSessions.get(requestId);
+  if (controller) {
+    controller.abort('Client requested disconnect');
+    activeResearchSessions.delete(requestId);
+    res.status(200).json({ 
+      status: 'success', 
+      message: 'Research session aborted successfully' 
+    });
+  } else {
+    res.status(404).json({ 
+      status: 'error', 
+      message: 'No active research session found with this ID' 
+    });
   }
 });
 

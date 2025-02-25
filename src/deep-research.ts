@@ -53,6 +53,7 @@ export type SearchCallbacks = {
   onSearchComplete?: (response: SearchResponse) => void;
   onProcessStart?: (processor: ResultProcessor, query: string) => void;
   onProcessComplete?: (results: { learnings: string[]; followUpQuestions: string[] }) => void;
+  signal?: AbortSignal;
 };
 
 // increase this if you have higher API rate limits
@@ -236,6 +237,7 @@ export interface ResultProcessor {
     result: SearchResponse;
     numLearnings?: number;
     numFollowUpQuestions?: number;
+    signal?: AbortSignal;
   }) => Promise<{
     learnings: string[];
     followUpQuestions: string[];
@@ -385,6 +387,7 @@ interface QueryGeneratorParams {
   query: string;
   numQueries?: number;
   learnings?: string[];
+  signal?: AbortSignal;
 }
 
 interface SearchParams {
@@ -395,6 +398,7 @@ interface SearchParams {
     scrapeOptions?: {
       formats?: string[];
     };
+    signal?: AbortSignal;
   };
 }
 
@@ -403,6 +407,7 @@ interface ResultProcessorParams {
   result: SearchResponse;
   numLearnings?: number;
   numFollowUpQuestions?: number;
+  signal?: AbortSignal;
 }
 
 // Modify createApiBasedTools to support multiple tools
@@ -535,6 +540,7 @@ export async function deepResearch({
   onProcessComplete,
   agentTools = defaultAgentTools,
   agentApiConfig,
+  signal,
 }: {
   query: string;
   breadth: number;
@@ -543,7 +549,13 @@ export async function deepResearch({
   visitedUrls?: string[];
   agentTools?: AgentTools;
   agentApiConfig?: AgentApiConfig;
+  signal?: AbortSignal;
 } & SearchCallbacks): Promise<ResearchResult> {
+  // Add signal check at the start
+  if (signal?.aborted) {
+    throw new Error('Research aborted by client');
+  }
+
   const tools = agentApiConfig ? await createApiBasedTools(agentApiConfig) : agentTools;
 
   const progress: ResearchProgress = {
@@ -581,16 +593,32 @@ export async function deepResearch({
     serpQueries.map(serpQuery =>
       limit(async () => {
         try {
+          // Check abort signal before starting each query
+          if (signal?.aborted) {
+            throw new Error('Research aborted by client');
+          }
+
           // Select and use appropriate searcher
           const selectedSearcher = selectSearcher(tools.searchers, serpQuery.query);
           onSearchStart?.(selectedSearcher, serpQuery.query);
           
+          // Check abort signal before search
+          if (signal?.aborted) {
+            throw new Error('Research aborted by client');
+          }
+
           const result = await selectedSearcher.search(serpQuery.query, {
             timeout: 15000,
-            limit: 5,
+            limit: 3,
             scrapeOptions: { formats: ['markdown'] },
+            signal, // Pass abort signal to search
           });
           onSearchComplete?.(result);
+
+          // Check abort signal after search
+          if (signal?.aborted) {
+            throw new Error('Research aborted by client');
+          }
 
           // Collect URLs from this search
           const newUrls = compact(result.data.map(item => item.url));
@@ -601,13 +629,24 @@ export async function deepResearch({
           const selectedProcessor = selectResultProcessor(tools.resultProcessors, serpQuery.query, result);
           onProcessStart?.(selectedProcessor, serpQuery.query);
           
+          // Check abort signal before processing
+          if (signal?.aborted) {
+            throw new Error('Research aborted by client');
+          }
+
           const newLearnings = await selectedProcessor.processResults({
             query: serpQuery.query,
             result,
             numFollowUpQuestions: newBreadth,
+            signal, // Pass abort signal to processor
           });
           onProcessComplete?.(newLearnings);
           
+          // Check abort signal after processing
+          if (signal?.aborted) {
+            throw new Error('Research aborted by client');
+          }
+
           const allLearnings = [...learnings, ...newLearnings.learnings];
           const allUrls = [...visitedUrls, ...newUrls];
 
@@ -628,6 +667,11 @@ export async function deepResearch({
             Follow-up research directions: ${newLearnings.followUpQuestions.map(q => `\n${q}`).join('')}
           `.trim();
 
+            // Check abort signal before recursive call
+            if (signal?.aborted) {
+              throw new Error('Research aborted by client');
+            }
+
             return deepResearch({
               query: nextQuery,
               breadth: newBreadth,
@@ -641,6 +685,7 @@ export async function deepResearch({
               onProcessComplete,
               agentTools: tools,
               agentApiConfig,
+              signal,
             });
           } else {
             reportProgress({
@@ -654,6 +699,12 @@ export async function deepResearch({
             };
           }
         } catch (e: any) {
+          // Check if error is from abort signal
+          if (signal?.aborted || (e.message && e.message.includes('aborted'))) {
+            log(`Research aborted for query: ${serpQuery.query}`);
+            throw e; // Re-throw abort error to stop other queries
+          }
+
           if (e.message && e.message.includes('Timeout')) {
             log(
               `Timeout error running query: ${serpQuery.query}: `,
@@ -669,7 +720,14 @@ export async function deepResearch({
         }
       }),
     ),
-  );
+  ).catch(error => {
+    // If any query throws an abort error, stop all queries
+    if (error.message && error.message.includes('aborted')) {
+      throw error;
+    }
+    // For other errors, return empty results
+    return [];
+  });
 
   return {
     learnings: [...new Set(results.flatMap(r => r.learnings))],
