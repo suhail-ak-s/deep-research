@@ -74,10 +74,22 @@ Error: ${err.message}
   };
 
   if (req.headers.accept?.includes('text/event-stream')) {
-    sendSSEMessage(res, 'error', errorResponse);
+    sendSSEMessage(res, 'message', {
+      type: 'error',
+      errorType: 'server_error',
+      requestId,
+      error: err.message,
+      timestamp: new Date().toISOString()
+    });
     res.end();
   } else {
-    res.status(500).json(errorResponse);
+    res.status(500).json({
+      type: 'error',
+      errorType: 'server_error',
+      requestId,
+      error: err.message,
+      timestamp: new Date().toISOString()
+    });
   }
 });
 
@@ -181,12 +193,16 @@ app.post('/api/research', async (req, res) => {
     });
     
     // Send initial connection message with requestId
-    sendSSEMessage(res, 'init', { 
-      requestId,
-      message: `# 🔍 Deep Research Session Started
-Request ID: ${requestId}
-
-*Initializing your research journey...*`
+    sendSSEMessage(res, 'message', { 
+      type: 'activity',
+      subtype: 'initialization',
+      activity: 'Research Session Started',
+      timestamp: new Date().toISOString(),
+      details: {
+        requestId,
+        status: 'started',
+        message: 'Initializing your research journey...'
+      }
     });
   }
 
@@ -210,15 +226,22 @@ Request ID: ${requestId}
       });
 
       if (wantsSSE) {
-        sendSSEMessage(res, 'error', {
-          message: `# ❌ Validation Error
-Request ID: ${requestId}
-
-${error.message}`
+        sendSSEMessage(res, 'message', {
+          type: 'error',
+          errorType: 'validation_error',
+          requestId,
+          error: error.message,
+          timestamp: new Date().toISOString()
         });
         return res.end();
       }
-      return res.status(400).json({ requestId, error: error.message });
+      return res.status(400).json({
+        type: 'error',
+        errorType: 'validation_error',
+        requestId,
+        error: error.message,
+        timestamp: new Date().toISOString()
+      });
     }
 
     // Validate research parameters
@@ -296,51 +319,55 @@ ${error.message}`
       signal, // Pass abort signal to deepResearch
       onProgress: (progress) => {
         if (wantsSSE && (!lastProgress || JSON.stringify(progress) !== JSON.stringify(lastProgress))) {
-          // Send research depth info
-          if (progress.currentDepth !== lastProgress?.currentDepth) {
-            sendSSEMessage(res, 'message', {
-              message: `# 📊 Research Progress
-
-### Iteration ${progress.totalDepth - progress.currentDepth + 1} of ${progress.totalDepth}
-Currently at depth level ${progress.currentDepth} with ${progress.currentDepth} iterations remaining
-
----`
-            });
-          }
+          // Always send progress updates whenever any progress metric changes
+          sendSSEMessage(res, 'message', {
+            type: 'progress',
+            currentIteration: progress.totalDepth - progress.currentDepth + 1,
+            totalIterations: progress.totalDepth,
+            depthLevel: progress.currentDepth,
+            remainingIterations: progress.currentDepth,
+            completedQueries: progress.completedQueries,
+            totalQueries: progress.totalQueries,
+            percentage: Math.round((progress.completedQueries / progress.totalQueries) * 100),
+            message: `Research Iteration ${progress.totalDepth - progress.currentDepth + 1} of ${progress.totalDepth}`
+          });
 
           // Send generated queries if available and changed
           if (progress.generatedQueries && (!lastProgress?.generatedQueries || 
               JSON.stringify(progress.generatedQueries) !== JSON.stringify(lastProgress.generatedQueries))) {
-            const queriesMessage = progress.generatedQueries.map((q, i) => 
-              `### 🔍 Query ${i + 1}
-**Search Query:**
-${q.query}
-
-**Research Goal:**
-${q.researchGoal}`
-            ).join('\n\n---\n\n');
-
+            
             sendSSEMessage(res, 'message', {
-              message: `# 🎯 Generated Research Queries
-
-${queriesMessage}
-
----`
+              type: 'activity',
+              subtype: 'queries_generated',
+              activity: 'Generated research queries',
+              timestamp: new Date().toISOString(),
+              details: {
+                queries: progress.generatedQueries.map((q, i) => ({
+                  id: i + 1,
+                  query: q.query,
+                  researchGoal: q.researchGoal
+                })),
+                status: 'completed'
+              }
             });
           }
 
           // Send current query if changed
           if (progress.currentQuery && progress.currentQuery !== lastProgress?.currentQuery) {
             sendSSEMessage(res, 'message', {
-              message: `# 🔄 Research In Progress
-
-### Currently Investigating
-${progress.currentQuery}
-
-### Progress
-✓ ${progress.completedQueries} of ${progress.totalQueries} queries completed
-
----`
+              type: 'activity',
+              subtype: 'current_activity',
+              activity: `Analyzing ${progress.currentQuery}`,
+              timestamp: new Date().toISOString(),
+              details: {
+                query: progress.currentQuery,
+                status: 'in_progress',
+                progress: {
+                  completed: progress.completedQueries,
+                  total: progress.totalQueries,
+                  percentage: Math.round((progress.completedQueries / progress.totalQueries) * 100)
+                }
+              }
             });
           }
 
@@ -350,60 +377,113 @@ ${progress.currentQuery}
       onSearchStart: (searcher, query) => {
         if (wantsSSE) {
           sendSSEMessage(res, 'message', {
-            message: `# 🔍 Search Phase
-
-### Using Research Tool
-**${searcher.metadata.name}**
-*Capabilities: ${searcher.metadata.capabilities.join(', ')}*
-
-### Current Query
-${query}
-
----`
+            type: 'activity',
+            subtype: 'search_phase',
+            activity: `Searching ${query}`,
+            timestamp: new Date().toISOString(),
+            details: {
+              tool: {
+                name: searcher.metadata.name,
+                capabilities: searcher.metadata.capabilities
+              },
+              query: query,
+              status: 'in_progress'
+            }
           });
+          
+          if (lastProgress) {
+            sendSSEMessage(res, 'message', {
+              type: 'progress',
+              currentIteration: lastProgress.totalDepth - lastProgress.currentDepth + 1,
+              totalIterations: lastProgress.totalDepth,
+              depthLevel: lastProgress.currentDepth,
+              remainingIterations: lastProgress.currentDepth,
+              completedQueries: lastProgress.completedQueries,
+              totalQueries: lastProgress.totalQueries,
+              percentage: Math.round((lastProgress.completedQueries / lastProgress.totalQueries) * 100),
+              message: `Searching: ${query}`
+            });
+          }
         }
       },
       onProcessStart: (processor, query) => {
         if (wantsSSE) {
           sendSSEMessage(res, 'message', {
-            message: `# 🔄 Processing Phase
-
-### Using Processor
-**${processor.metadata.name}**
-*Capabilities: ${processor.metadata.capabilities.join(', ')}*
-
-### Processing Query
-${query}
-
----`
+            type: 'activity',
+            subtype: 'process_phase',
+            activity: `Processing ${query}`,
+            timestamp: new Date().toISOString(),
+            details: {
+              tool: {
+                name: processor.metadata.name,
+                capabilities: processor.metadata.capabilities
+              },
+              query: query,
+              status: 'in_progress'
+            }
           });
+          
+          if (lastProgress) {
+            sendSSEMessage(res, 'message', {
+              type: 'progress',
+              currentIteration: lastProgress.totalDepth - lastProgress.currentDepth + 1,
+              totalIterations: lastProgress.totalDepth,
+              depthLevel: lastProgress.currentDepth,
+              remainingIterations: lastProgress.currentDepth,
+              completedQueries: lastProgress.completedQueries,
+              totalQueries: lastProgress.totalQueries,
+              percentage: Math.round((lastProgress.completedQueries / lastProgress.totalQueries) * 100),
+              message: `Processing: ${query}`
+            });
+          }
         }
       },
       onProcessComplete: (results) => {
-        if (wantsSSE && results.learnings?.length > 0) {
-          const learningsMessage = results.learnings.map((learning, i) => `${i + 1}. ${learning}`).join('\n');
-          const questionsMessage = results.followUpQuestions.map((q, i) => `${i + 1}. ${q}`).join('\n');
-
+        if (wantsSSE) {
+          if (results.learnings?.length > 0) {
+            sendSSEMessage(res, 'message', {
+              type: 'sources',
+              subtype: 'findings',
+              timestamp: new Date().toISOString(),
+              learnings: results.learnings,
+              followUpQuestions: results.followUpQuestions
+            });
+          }
+          
           sendSSEMessage(res, 'message', {
-            message: `# 📝 New Research Findings
-
-### Key Learnings
-${learningsMessage}
-
-### Follow-up Questions
-${questionsMessage}
-
----`
+            type: 'activity',
+            subtype: 'process_complete',
+            activity: `Found ${results.learnings?.length || 0} relevant results`,
+            timestamp: new Date().toISOString(),
+            details: {
+              status: 'completed',
+              resultsCount: results.learnings?.length || 0
+            }
           });
+          
+          if (lastProgress) {
+            // Increment completed queries temporarily for UI responsiveness
+            // (the real value will be updated through onProgress)
+            const completedQueries = Math.min(lastProgress.completedQueries + 1, lastProgress.totalQueries);
+            
+            sendSSEMessage(res, 'message', {
+              type: 'progress',
+              currentIteration: lastProgress.totalDepth - lastProgress.currentDepth + 1,
+              totalIterations: lastProgress.totalDepth,
+              depthLevel: lastProgress.currentDepth,
+              remainingIterations: lastProgress.currentDepth,
+              completedQueries: completedQueries,
+              totalQueries: lastProgress.totalQueries,
+              percentage: Math.round((completedQueries / lastProgress.totalQueries) * 100),
+              message: `Processed findings`
+            });
+          }
         }
       }
     });
 
     // Generate the final report
     if (wantsSSE) {
-      const learningsMessage = result.learnings.map((learning, i) => `${i + 1}. ${learning}`).join('\n');
-      const urlsMessage = result.visitedUrls.map((url, i) => `${i + 1}. [Source](${url})`).join('\n');
-
       console.log({
         timestamp: new Date().toISOString(),
         requestId,
@@ -414,16 +494,17 @@ ${questionsMessage}
         }
       });
 
+      // Send the sources update
       sendSSEMessage(res, 'message', {
-        message: `# 📊 Final Research Results
-
-## Key Findings
-${learningsMessage}
-
-## Sources Referenced
-${urlsMessage}
-
----`
+        type: 'sources',
+        subtype: 'source_update',
+        timestamp: new Date().toISOString(),
+        sources: result.visitedUrls.map(url => ({
+          url,
+          title: new URL(url).hostname,
+          extractedAt: new Date().toISOString()
+        })),
+        learnings: result.learnings
       });
 
       console.log({
@@ -433,11 +514,26 @@ ${urlsMessage}
       });
 
       sendSSEMessage(res, 'message', { 
-        message: `# 📝 Generating Final Report
-
-*Compiling and formatting all research findings...*
-
----`
+        type: 'activity',
+        subtype: 'report_generation',
+        activity: 'Generating Final Report',
+        timestamp: new Date().toISOString(),
+        details: {
+          status: 'in_progress',
+          message: 'Compiling and formatting all research findings...'
+        }
+      });
+      
+      sendSSEMessage(res, 'message', {
+        type: 'progress',
+        currentIteration: 1,
+        totalIterations: 1,
+        depthLevel: 0,
+        remainingIterations: 0,
+        completedQueries: result.learnings.length,
+        totalQueries: result.learnings.length + 1, // Add one for report generation
+        percentage: 95, // Leave a little room for final report generation
+        message: 'Generating final report...'
       });
     }
 
@@ -461,22 +557,48 @@ ${urlsMessage}
       reportLength: report.length
     });
 
-    const finalResponse = {
-      message: `# ✅ Research Complete
-
-${report}
-
----
-*End of Research Report*`
-    };
-
     if (wantsSSE) {
-      sendSSEMessage(res, 'message', finalResponse);
+      sendSSEMessage(res, 'message', {
+        type: 'sources',
+        subtype: 'final_results',
+        timestamp: new Date().toISOString(),
+        sources: result.visitedUrls.map(url => ({
+          url,
+          title: new URL(url).hostname,
+          extractedAt: new Date().toISOString()
+        })),
+        learnings: result.learnings,
+        report: report
+      });
+      
+      sendSSEMessage(res, 'message', {
+        type: 'activity',
+        subtype: 'report_generation',
+        activity: 'Research Complete',
+        timestamp: new Date().toISOString(),
+        details: {
+          status: 'completed',
+          message: 'Research completed successfully'
+        }
+      });
+      
       console.log({
         timestamp: new Date().toISOString(),
         requestId,
         event: 'sse_research_complete',
         messageType: 'final_report'
+      });
+      
+      sendSSEMessage(res, 'message', {
+        type: 'progress',
+        currentIteration: 1,
+        totalIterations: 1,
+        depthLevel: 0,
+        remainingIterations: 0,
+        completedQueries: result.learnings.length + 1, // Include report generation
+        totalQueries: result.learnings.length + 1,
+        percentage: 100,
+        message: 'Research complete!'
       });
       res.end();
     } else {
@@ -486,7 +608,14 @@ ${report}
         event: 'research_complete',
         responseType: 'json'
       });
-      res.json(finalResponse);
+      res.json({
+        message: `# ✅ Research Complete
+
+${report}
+
+---
+*End of Research Report*`
+      });
     }
   } catch (error) {
     // Debug point: Log error details
@@ -527,10 +656,22 @@ ${error instanceof Error ? error.message : 'An unknown error occurred'}
     };
 
     if (wantsSSE) {
-      sendSSEMessage(res, 'error', errorResponse);
+      sendSSEMessage(res, 'message', {
+        type: 'error',
+        errorType: 'research_error',
+        requestId,
+        error: error instanceof Error ? error.message : 'An unknown error occurred',
+        timestamp: new Date().toISOString()
+      });
       res.end();
     } else {
-      res.status(500).json({ requestId, ...errorResponse });
+      res.status(500).json({ 
+        type: 'error',
+        errorType: 'research_error',
+        requestId, 
+        error: error instanceof Error ? error.message : 'An unknown error occurred',
+        timestamp: new Date().toISOString()
+      });
     }
   }
 });
